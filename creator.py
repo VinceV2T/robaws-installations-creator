@@ -139,6 +139,9 @@ def main() -> int:
 
     # Caches
     sales_order_cache = {}     # salesOrderId -> SalesOrderReadDTO
+    # Installaties die we tijdens DEZE run reeds geclaimd hebben (om binnen
+    # 1 run niet 2x dezelfde te hergebruiken voor 2 verschillende lijnen).
+    claimed_installation_ids = set()
 
     # 3) Per bestelbon de lijnen verwerken
     for bb in bestelbonnen:
@@ -249,13 +252,24 @@ def main() -> int:
                 quantity = 1  # minimum 1 als veiligheid
 
             # Eerst checken of er al installaties bestaan voor (project, artikel).
-            # Manueel aangemaakte installaties die nog niet via materialId
-            # gekoppeld zijn, mogen hergebruikt worden i.p.v. dupliceren.
+            # Enkel installaties die nog niet aan een bestelbon-lijn gekoppeld
+            # zijn (vrij) komen in aanmerking voor hergebruik. Anders zouden
+            # twee bestelbon-lijnen voor hetzelfde artikel beide naar dezelfde
+            # installatie linken.
             existing_installations = []
             try:
-                existing_installations = find_installations(
+                all_existing = find_installations(
                     session, base_url, project_id, article_id
                 )
+                for inst in all_existing:
+                    inst_id = inst.get("id")
+                    if not inst_id:
+                        continue
+                    if inst_id in claimed_installation_ids:
+                        continue   # geclaimd door eerdere lijn in deze run
+                    if is_installation_in_use(session, base_url, inst_id):
+                        continue   # al gelinkt aan een andere bestelbon-lijn
+                    existing_installations.append(inst)
             except Exception as exc:
                 report["errors"].append({
                     "stage": "find_installations",
@@ -306,15 +320,17 @@ def main() -> int:
             if existing_installations:
                 first_installation_id = existing_installations[0].get("id")
                 for inst in existing_installations[:quantity]:
+                    inst_id = inst.get("id")
+                    claimed_installation_ids.add(inst_id)
                     report["installations_reused"].append({
                         "bestelbon": bb_logic, "line_id": line_id,
                         "project_id": project_id,
                         "article_number": article_number,
-                        "installation_id": inst.get("id"),
+                        "installation_id": inst_id,
                         "installation_name": inst.get("name"),
                     })
                     print(f"  [HERGEBRUIK] {bb_logic} lijn {line_id}: "
-                          f"bestaande installatie {inst.get('id')} ({inst.get('name')}) "
+                          f"bestaande installatie {inst_id} ({inst.get('name')}) "
                           f"voor {article_number} gevonden, geen nieuwe gemaakt")
 
             # Aanvullen met nieuwe installaties indien nodig
@@ -341,6 +357,8 @@ def main() -> int:
                     try:
                         created = create_installation(session, base_url, payload)
                         installation_id = created.get("id")
+                        if installation_id:
+                            claimed_installation_ids.add(installation_id)
                         if first_installation_id is None and n == 0:
                             first_installation_id = installation_id
                         report["installations_created"].append({
@@ -568,6 +586,27 @@ def find_installations(session, base_url, project_id, article_id):
     r.raise_for_status()
     payload = r.json()
     return payload.get("items") or []
+
+
+def is_installation_in_use(session, base_url, installation_id):
+    """True als er al een bestelbon-lijn bestaat met materialId = installation_id.
+
+    Vermijdt dat we eenzelfde installatie aan twee verschillende bestelbon-
+    lijnen koppelen.
+    """
+    if not installation_id:
+        return False
+    url = f"{base_url}/api/v2/purchase-supply-orders"
+    params = {"materialId": installation_id, "size": 1, "page": 0}
+    try:
+        r = session.get(url, params=params, timeout=30)
+    except requests.RequestException:
+        # Bij netwerkfout: conservatief als 'in use' beschouwen om geen
+        # foute hergebruik te doen.
+        return True
+    if r.status_code != 200:
+        return True
+    return bool(r.json().get("items") or [])
 
 
 def create_installation(session, base_url, payload):
