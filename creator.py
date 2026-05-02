@@ -50,6 +50,7 @@ import datetime as dt
 import glob
 import json
 import os
+import re
 import smtplib
 import sys
 from email.mime.text import MIMEText
@@ -63,6 +64,80 @@ from requests.auth import HTTPBasicAuth
 DEFAULT_STATUS = "Actief"
 DATA_DIR = Path(__file__).parent / "data"
 ARTICLE_NUMBER_COL = "Art.nummer"      # kolomnaam in de Excel(s)
+
+# ---------- Auto-serienummer voor artikelen zonder fabrieks-SN -------------
+# Bepaalde artikelreeksen (drogers, olie/water afscheiders, AIRSAVER) krijgen
+# geen serienummer van de leverancier. We genereren er zelf een volgens het
+# formaat: {PREFIX}-{ORDER_LOGIC_ID}-{N}.
+#
+# Elke regel = (regex op artikelnaam, manier om de prefix uit de naam te
+# halen). De regex wordt case-insensitive uitgevoerd op de artikelnaam
+# (article.name OR line.description).
+AUTO_SERIAL_RULES = [
+    # CDE 5, CDE 8, CDE 12, CDE-12, CDE12 → 'CDE5', 'CDE8', etc.
+    {"pattern": re.compile(r"\bCDE\s*-?\s*(\d+)", re.IGNORECASE),
+     "prefix_template": "CDE{0}"},
+    # OWS 53, OWS 100, OWS-53 → 'OWS53', 'OWS100', etc.
+    {"pattern": re.compile(r"\bOWS\s*-?\s*(\d+)", re.IGNORECASE),
+     "prefix_template": "OWS{0}"},
+    # AIRSAVER (alle varianten) → 'AIRSAVER'
+    {"pattern": re.compile(r"\bAIRSAVER\b", re.IGNORECASE),
+     "prefix_template": "AIRSAVER"},
+]
+
+
+def detect_auto_serial_prefix(article_name):
+    """Geeft de auto-serial prefix terug (bv. 'CDE5') of None als het artikel
+    niet in de auto-serial families zit."""
+    if not article_name:
+        return None
+    for rule in AUTO_SERIAL_RULES:
+        m = rule["pattern"].search(article_name)
+        if not m:
+            continue
+        # Vul de capture groups in (indien aanwezig) in de prefix-template
+        try:
+            return rule["prefix_template"].format(*m.groups()).upper()
+        except (IndexError, KeyError):
+            return rule["prefix_template"].upper()
+    return None
+
+
+def next_auto_serial_n(serial_counters, session, base_url,
+                       project_id, article_id, prefix, order_logic_id):
+    """Bepaal de volgende N voor {prefix}-{order_logic_id}-{N}.
+
+    Eerst wordt Robaws bevraagd voor de actueel hoogste N (over alle
+    bestaande installaties met datzelfde patroon). Daarna wordt er lokaal
+    geteld in `serial_counters` zodat we binnen één run niet 2x dezelfde N
+    geven.
+    """
+    key = (prefix, order_logic_id)
+    if key in serial_counters:
+        serial_counters[key] += 1
+        return serial_counters[key]
+
+    pattern_prefix = f"{prefix}-{order_logic_id}-"
+    max_n = 0
+    try:
+        existing = find_installations(session, base_url, project_id, article_id)
+    except Exception:
+        existing = []
+    for inst in existing:
+        sn = (inst.get("serialNumber") or "").strip()
+        if sn.startswith(pattern_prefix):
+            try:
+                n = int(sn[len(pattern_prefix):])
+                if n > max_n:
+                    max_n = n
+            except ValueError:
+                pass
+    serial_counters[key] = max_n + 1
+    return serial_counters[key]
+
+
+def build_auto_serial(prefix, order_logic_id, n):
+    return f"{prefix}-{order_logic_id}-{n}"
 
 
 # ---------- Hoofdlogica ----------------------------------------------------
@@ -114,10 +189,13 @@ def main() -> int:
         "installations_created": [],         # nieuwe installaties via POST
         "installations_reused": [],          # bestaande installaties hergebruikt (geen POST)
         "lines_linked": [],                  # bestelbon-lijnen met materialId gepatcht
+        "auto_serials_assigned": [],         # auto-gegenereerde serienummers
         "skipped_already_linked": [],        # materialId was al gezet
         "skipped_not_in_masterlist": 0,      # tellen, niet detail
         "errors": [],
     }
+    # In-memory teller voor auto-serials, key=(prefix, order_logic_id)
+    serial_counters = {}
 
     # 2) Bestelbonnen ophalen
     try:
@@ -317,6 +395,10 @@ def main() -> int:
             # bestaande installatie (zo blijft de manueel aangemaakte fiche
             # leidend); anders uit de eerste nieuw aangemaakte installatie.
             first_installation_id = None
+            # Detecteer of dit artikel een auto-serienummer moet krijgen
+            auto_prefix = detect_auto_serial_prefix(article_name)
+            order_logic_id = (so.get("logicId") or "").strip()
+
             if existing_installations:
                 first_installation_id = existing_installations[0].get("id")
                 for inst in existing_installations[:quantity]:
@@ -333,8 +415,60 @@ def main() -> int:
                           f"bestaande installatie {inst_id} ({inst.get('name')}) "
                           f"voor {article_number} gevonden, geen nieuwe gemaakt")
 
+                    # Hergebruik + auto-serial: vul ook serienummer in als
+                    # de bestaande installatie er nog geen heeft.
+                    current_sn = (inst.get("serialNumber") or "").strip()
+                    if auto_prefix and order_logic_id and not current_sn:
+                        n = next_auto_serial_n(
+                            serial_counters, session, base_url,
+                            project_id, article_id, auto_prefix, order_logic_id,
+                        )
+                        new_sn = build_auto_serial(auto_prefix, order_logic_id, n)
+                        if dry_run:
+                            report["auto_serials_assigned"].append({
+                                "installation_id": inst_id,
+                                "serial_number": new_sn,
+                                "source": "backfill",
+                                "action": "WOULD_PATCH_SERIAL",
+                            })
+                            print(f"     [DRY] zou serienummer zetten op {new_sn}")
+                        else:
+                            try:
+                                patch_installation_serial(
+                                    session, base_url, inst_id, new_sn
+                                )
+                                report["auto_serials_assigned"].append({
+                                    "installation_id": inst_id,
+                                    "serial_number": new_sn,
+                                    "source": "backfill",
+                                    "action": "PATCH_SERIAL",
+                                })
+                                print(f"     [LIVE] serienummer gezet: {new_sn}")
+                            except Exception as exc:
+                                report["errors"].append({
+                                    "stage": "patch_serial_backfill",
+                                    "installation_id": inst_id,
+                                    "error": str(exc),
+                                })
+
             # Aanvullen met nieuwe installaties indien nodig
             for n in range(to_create):
+                # Auto-serienummer berekenen (indien van toepassing)
+                this_serial = ""
+                if auto_prefix and order_logic_id:
+                    n_serial = next_auto_serial_n(
+                        serial_counters, session, base_url,
+                        project_id, article_id, auto_prefix, order_logic_id,
+                    )
+                    this_serial = build_auto_serial(
+                        auto_prefix, order_logic_id, n_serial
+                    )
+                # Maak een lokale payload-kopie zodat ieder stuk zijn eigen
+                # serienummer krijgt zonder de "template" payload te muteren.
+                this_payload = dict(payload)
+                if this_serial:
+                    this_payload["serialNumber"] = this_serial
+
                 if dry_run:
                     report["installations_created"].append({
                         "bestelbon": bb_logic, "line_id": line_id,
@@ -342,25 +476,43 @@ def main() -> int:
                         "article_number": article_number,
                         "article_name": article_name,
                         "action": "WOULD_POST",
+                        "auto_serial": this_serial or None,
                         "payload_preview": {
-                            "name": payload.get("name"),
-                            "brand": payload.get("brand"),
-                            "city": (payload.get("address") or {}).get("city"),
+                            "name": this_payload.get("name"),
+                            "brand": this_payload.get("brand"),
+                            "city": (this_payload.get("address") or {}).get("city"),
+                            "serialNumber": this_payload.get("serialNumber"),
                         },
                     })
+                    if this_serial:
+                        report["auto_serials_assigned"].append({
+                            "serial_number": this_serial,
+                            "source": "new",
+                            "action": "WOULD_POST_WITH_SERIAL",
+                            "bestelbon": bb_logic, "line_id": line_id,
+                        })
                     print(f"  [DRY] {bb_logic} lijn {line_id}: "
                           f"zou installatie {already_count+n+1}/{quantity} aanmaken voor "
-                          f"{article_number} ({article_name}) op project {project_id}")
+                          f"{article_number} ({article_name}) op project {project_id}"
+                          + (f" met SN {this_serial}" if this_serial else ""))
                     if first_installation_id is None and n == 0:
                         first_installation_id = "<DRY_ID>"
                 else:
                     try:
-                        created = create_installation(session, base_url, payload)
+                        created = create_installation(session, base_url, this_payload)
                         installation_id = created.get("id")
                         if installation_id:
                             claimed_installation_ids.add(installation_id)
                         if first_installation_id is None and n == 0:
                             first_installation_id = installation_id
+                        if this_serial:
+                            report["auto_serials_assigned"].append({
+                                "installation_id": installation_id,
+                                "serial_number": this_serial,
+                                "source": "new",
+                                "action": "POST_WITH_SERIAL",
+                                "bestelbon": bb_logic, "line_id": line_id,
+                            })
                         report["installations_created"].append({
                             "bestelbon": bb_logic, "line_id": line_id,
                             "project_id": project_id,
@@ -368,10 +520,12 @@ def main() -> int:
                             "article_name": article_name,
                             "action": "POST",
                             "installation_id": installation_id,
+                            "auto_serial": this_serial or None,
                         })
                         print(f"  [LIVE] {bb_logic} lijn {line_id}: "
                               f"installatie {already_count+n+1}/{quantity} aangemaakt "
-                              f"(id={installation_id}) voor {article_number}")
+                              f"(id={installation_id}) voor {article_number}"
+                              + (f" met SN {this_serial}" if this_serial else ""))
                     except Exception as exc:
                         report["errors"].append({
                             "stage": "create_installation",
@@ -426,6 +580,7 @@ def main() -> int:
     print(f"Lijnen matched (masterlist) : {report['lines_matched']}")
     print(f"Installaties aangemaakt     : {len(report['installations_created'])}")
     print(f"Installaties hergebruikt    : {len(report['installations_reused'])}")
+    print(f"Auto-serienummers toegekend : {len(report['auto_serials_assigned'])}")
     print(f"Bestelbon-lijnen gelinkt    : {len(report['lines_linked'])}")
     print(f"Skipped (materialId al gezet): {len(report['skipped_already_linked'])}")
     print(f"Skipped (niet in masterlist): {report['skipped_not_in_masterlist']}")
@@ -616,6 +771,19 @@ def create_installation(session, base_url, payload):
         return r.json()
     raise RuntimeError(
         f"POST installation faalde: status={r.status_code}, body={r.text[:300]!r}"
+    )
+
+
+def patch_installation_serial(session, base_url, installation_id, serial_number):
+    """Zet het serienummer op een bestaande installatie via PATCH."""
+    url = f"{base_url}/api/v2/installations/{installation_id}"
+    body = {"serialNumber": serial_number}
+    r = session.patch(url, json=body, timeout=30)
+    if r.status_code in (200, 204):
+        return url
+    raise RuntimeError(
+        f"PATCH serialNumber faalde op {url}: status={r.status_code}, "
+        f"body={r.text[:300]!r}"
     )
 
 
