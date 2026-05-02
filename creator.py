@@ -434,19 +434,19 @@ def main() -> int:
                             print(f"     [DRY] zou serienummer zetten op {new_sn}")
                         else:
                             try:
-                                patch_installation_serial(
-                                    session, base_url, inst_id, new_sn
+                                put_installation_serial(
+                                    session, base_url, inst, new_sn
                                 )
                                 report["auto_serials_assigned"].append({
                                     "installation_id": inst_id,
                                     "serial_number": new_sn,
                                     "source": "backfill",
-                                    "action": "PATCH_SERIAL",
+                                    "action": "PUT_SERIAL",
                                 })
                                 print(f"     [LIVE] serienummer gezet: {new_sn}")
                             except Exception as exc:
                                 report["errors"].append({
-                                    "stage": "patch_serial_backfill",
+                                    "stage": "put_serial_backfill",
                                     "installation_id": inst_id,
                                     "error": str(exc),
                                 })
@@ -549,25 +549,25 @@ def main() -> int:
                           f"zou materialId zetten op {first_installation_id}")
                 else:
                     try:
-                        patch_bestelbon_line_material(
-                            session, base_url, bb_id, line_id, first_installation_id
+                        put_bestelbon_line_material(
+                            session, base_url, bb_id, line, first_installation_id
                         )
                         report["lines_linked"].append({
                             "bestelbon": bb_logic, "line_id": line_id,
-                            "action": "PATCH_MATERIAL",
+                            "action": "PUT_MATERIAL",
                             "material_id": first_installation_id,
                         })
                         print(f"  [LIVE] {bb_logic} lijn {line_id}: "
                               f"materialId gezet op {first_installation_id}")
                     except Exception as exc:
                         report["errors"].append({
-                            "stage": "patch_bestelbon_line",
+                            "stage": "put_bestelbon_line",
                             "bestelbon": bb_logic, "line_id": line_id,
                             "material_id": first_installation_id,
                             "error": str(exc),
                         })
                         print(f"  [ERROR] {bb_logic} lijn {line_id}: "
-                              f"PATCH materialId gefaald: {exc}")
+                              f"PUT materialId gefaald: {exc}")
 
     # 4) Samenvatting
     print()
@@ -774,33 +774,64 @@ def create_installation(session, base_url, payload):
     )
 
 
-def patch_installation_serial(session, base_url, installation_id, serial_number):
-    """Zet het serienummer op een bestaande installatie via PATCH."""
-    url = f"{base_url}/api/v2/installations/{installation_id}"
-    body = {"serialNumber": serial_number}
-    r = session.patch(url, json=body, timeout=30)
+# SKIP-set voor PUT-operaties: Robaws PUT vervangt de volledige resource,
+# dus we sturen alle scalaire velden mee maar laten relatie-objecten weg
+# (die worden afgeleid uit de scalaire IDs).
+_LINE_PUT_SKIP = {
+    "id", "createdAt", "updatedAt", "deletedAt", "archivedAt", "lockedAt",
+    "post", "articleSupplier", "article", "material", "activity",
+    "order", "project", "vatTariff", "_metadata",
+}
+_INSTALLATION_PUT_SKIP = {
+    "id", "createdAt", "updatedAt", "deletedAt", "archivedAt", "lockedAt",
+    "_metadata",
+    # Relatie-objecten (read-only):
+    "article", "supplier", "subscription", "assignedProject",
+    "assignedEmployee", "assignedClient", "assignedEndClient",
+    "assignedSubcontractor", "stockLocation", "company", "statusDetails",
+    "maintenanceSchedule", "maintenanceVisits", "files", "subscriptions",
+}
+
+
+def put_bestelbon_line_material(session, base_url, bestelbon_id, current_line, material_id):
+    """Update materieel-kolom (materialId) op een bestelbon-lijn via PUT.
+
+    Robaws PATCH geeft 415 "Unsupported Media Type", dus we gebruiken het
+    bewezen PUT-patroon (zelfde als robaws-invoice-linker): GET-modify-PUT
+    met de volledige lijn-inhoud. Relatie-objecten worden weggelaten.
+    """
+    line_id = current_line.get("id")
+    body = {k: v for k, v in current_line.items() if k not in _LINE_PUT_SKIP}
+    body["materialId"] = material_id
+    url = (f"{base_url}/api/v2/purchase-supply-orders/"
+           f"{bestelbon_id}/line-items/{line_id}")
+    r = session.put(url, json=body, timeout=30)
     if r.status_code in (200, 204):
         return url
     raise RuntimeError(
-        f"PATCH serialNumber faalde op {url}: status={r.status_code}, "
+        f"PUT line materialId faalde op {url}: status={r.status_code}, "
         f"body={r.text[:300]!r}"
     )
 
 
-def patch_bestelbon_line_material(session, base_url, bestelbon_id, line_id, material_id):
-    """Zet de materieel-kolom (materialId) op een bestelbon-lijn via PATCH.
+def put_installation_serial(session, base_url, current_installation, serial_number):
+    """Zet het serienummer op een bestaande installatie via PUT.
 
-    PATCH muteert enkel de meegegeven velden, dus we hoeven niet de hele lijn
-    over te sturen.
+    Zelfde reden als bij de bestelbon-lijn: PATCH wordt geweigerd, dus we
+    sturen de volledige resource met enkel het gewijzigde veld.
     """
-    url = (f"{base_url}/api/v2/purchase-supply-orders/"
-           f"{bestelbon_id}/line-items/{line_id}")
-    body = {"materialId": material_id}
-    r = session.patch(url, json=body, timeout=30)
+    installation_id = current_installation.get("id")
+    body = {
+        k: v for k, v in current_installation.items()
+        if k not in _INSTALLATION_PUT_SKIP
+    }
+    body["serialNumber"] = serial_number
+    url = f"{base_url}/api/v2/installations/{installation_id}"
+    r = session.put(url, json=body, timeout=30)
     if r.status_code in (200, 204):
         return url
     raise RuntimeError(
-        f"PATCH materialId faalde op {url}: status={r.status_code}, "
+        f"PUT installation serialNumber faalde op {url}: status={r.status_code}, "
         f"body={r.text[:300]!r}"
     )
 
