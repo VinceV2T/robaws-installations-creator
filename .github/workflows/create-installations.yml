@@ -1,0 +1,65 @@
+name: Nightly installations creator
+on:
+  schedule:
+    # 4x per dag in plaats van 1x om GitHub-cron-vertragingen op te vangen.
+    # 05:00, 09:00, 13:00, 17:00 UTC = 07:00, 11:00, 15:00, 19:00 Brussel.
+    # Idempotent: bestelbonnen die al verwerkt zijn worden niet opnieuw aangeraakt.
+    - cron: "0 5,9,13,17 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run (true = niets aanmaken, alleen loggen)"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      days_back:
+        description: "Aantal dagen terug om te scannen"
+        required: false
+        default: "14"
+        type: string
+      test_bestelbon:
+        description: "Optioneel: enkel deze bestelbon verwerken (logicId, bv. B260412). Leeg = alle in window."
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run creator
+        env:
+          ROBAWS_API_KEY: ${{ secrets.ROBAWS_API_KEY }}
+          ROBAWS_API_SECRET: ${{ secrets.ROBAWS_API_SECRET }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          DAYS_BACK: ${{ github.event.inputs.days_back || '14' }}
+          TEST_BESTELBON: ${{ github.event.inputs.test_bestelbon || '' }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python creator.py
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: create-report
+          path: create_report.json
+          if-no-files-found: warn
