@@ -437,39 +437,58 @@ def load_master_article_numbers(data_dir: Path) -> set:
 
 # ---------- Robaws API-helpers ---------------------------------------------
 def fetch_recent_bestelbonnen(session, base_url, cutoff_iso):
-    """Haal purchase-supply-orders op die sinds cutoff_iso zijn aangemaakt of gewijzigd.
+    """Haal purchase-supply-orders op sinds cutoff_iso.
 
-    We gebruiken het `updatedFrom` filter dat de Robaws API biedt.
+    Loopt pagina's van laatste naar eerste en filtert client-side op datum,
+    identiek patroon als robaws-invoice-linker (dat in productie draait).
+    Geen server-side `updatedFrom` of `sort` (die zijn bij sommige Robaws-
+    instanties niet beschikbaar en geven dan een 400).
     """
-    url = f"{base_url}/api/v2/purchase-supply-orders"
-    params = {
-        "size": 100,
-        "page": 0,
-        "updatedFrom": cutoff_iso,
-        "sort": "updatedAt,desc",
-    }
+    list_url = f"{base_url}/api/v2/purchase-supply-orders"
+    r = session.get(list_url, params={"size": 100, "page": 0}, timeout=30)
+    r.raise_for_status()
+    payload = r.json()
+    total_pages = (
+        payload.get("totalPages")
+        or (payload.get("page") or {}).get("totalPages")
+        or 1
+    )
     items = []
-    while True:
-        r = session.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        payload = r.json()
-        page_items = payload.get("items") or []
-        items.extend(page_items)
-        total_pages = (
-            payload.get("totalPages")
-            or (payload.get("page") or {}).get("totalPages")
-            or 1
-        )
-        if params["page"] + 1 >= total_pages or not page_items:
+    older_streak = 0
+    for page in range(total_pages - 1, -1, -1):
+        rr = session.get(list_url, params={"size": 100, "page": page}, timeout=30)
+        if rr.status_code != 200:
             break
-        params["page"] += 1
+        page_items = rr.json().get("items") or []
+        if not page_items:
+            break
+        page_added = 0
+        for bb in page_items:
+            bb_date = (
+                bb.get("date")
+                or (bb.get("updatedAt") or bb.get("createdAt") or "")[:10]
+            )
+            if bb_date and bb_date >= cutoff_iso:
+                items.append(bb)
+                page_added += 1
+        if page_added == 0:
+            older_streak += 1
+            if older_streak >= 2:
+                break
+        else:
+            older_streak = 0
     return items
 
 
 def fetch_bestelbon_lines(session, base_url, bestelbon_id):
-    """Haal lijnen van een bestelbon op met artikel- en order-info ge-include."""
+    """Haal lijnen van een bestelbon op met artikel-info ge-include.
+
+    Gebruikt een single include-waarde (Robaws ondersteunt geen
+    comma-separated include in alle versies). Order-info halen we apart
+    via fetch_sales_order zodra we de orderId kennen.
+    """
     url = f"{base_url}/api/v2/purchase-supply-orders/{bestelbon_id}/line-items"
-    params = {"include": "article,order", "size": 200, "page": 0}
+    params = {"include": "article", "size": 200, "page": 0}
     lines = []
     while True:
         r = session.get(url, params=params, timeout=30)
