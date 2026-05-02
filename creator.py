@@ -352,6 +352,7 @@ def main() -> int:
             # twee bestelbon-lijnen voor hetzelfde artikel beide naar dezelfde
             # installatie linken.
             existing_installations = []
+            all_existing = []
             try:
                 all_existing = find_installations(
                     session, base_url, project_id, article_id
@@ -372,6 +373,18 @@ def main() -> int:
                     "error": str(exc),
                 })
                 continue
+
+            # Leer het merk uit bestaande installaties als het artikel zelf
+            # geen merk heeft staan in Robaws. Sommige artikelen (zoals
+            # 'CPM 4 VS D 8 ...') hebben geen merk op artikel-niveau, terwijl
+            # eerder manueel aangemaakte fiches voor datzelfde artikel het
+            # merk WEL ingevuld hebben (bv. 'Chicago Pneumatic').
+            if not article_brand and all_existing:
+                for inst in all_existing:
+                    b = (inst.get("brand") or "").strip()
+                    if b:
+                        article_brand = b
+                        break
 
             # Payload bouwen voor de installatie (enkel nodig als we POST'en)
             payload = {
