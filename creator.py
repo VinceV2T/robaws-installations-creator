@@ -63,7 +63,23 @@ from requests.auth import HTTPBasicAuth
 # ---------- Configuratie (module-niveau) -----------------------------------
 DEFAULT_STATUS = "Actief"
 DATA_DIR = Path(__file__).parent / "data"
-ARTICLE_NUMBER_COL = "Art.nummer"      # kolomnaam in de Excel(s)
+# Mogelijke kolomnamen die het artikelnummer bevatten. Eerste match wordt
+# gebruikt. Maakt het mogelijk om zowel handgemaakte importlijsten als
+# Robaws-exports door elkaar te gebruiken.
+ARTICLE_NUMBER_COLS = ("Art.nummer", "Artikel Nr.", "Artikel nummer", "Article Number")
+
+
+def normalize_article_number(value):
+    """Normaliseer een artikelnummer voor vergelijking.
+
+    - String van maken
+    - Alle whitespace strippen (Robaws toont sommige nummers met spaties:
+      '0000 0506 91' moet matchen met '0000050691' uit de API)
+    """
+    if value is None:
+        return ""
+    s = str(value)
+    return "".join(s.split())
 
 # ---------- Auto-serienummer voor artikelen zonder fabrieks-SN -------------
 # Bepaalde artikelreeksen (drogers, olie/water afscheiders, AIRSAVER) krijgen
@@ -250,8 +266,9 @@ def main() -> int:
             article_name = article.get("name") or line.get("description") or ""
             article_brand = article.get("brand") or ""
 
-            # Filter: enkel artikelen uit de masterlijst
-            if not article_number or str(article_number) not in master_numbers:
+            # Filter: enkel artikelen uit de masterlijst (whitespace-genormaliseerd)
+            normalized_article_number = normalize_article_number(article_number)
+            if not normalized_article_number or normalized_article_number not in master_numbers:
                 report["skipped_not_in_masterlist"] += 1
                 continue
             report["lines_matched"] += 1
@@ -609,8 +626,10 @@ def main() -> int:
 def load_master_article_numbers(data_dir: Path) -> set:
     """Lees alle .xlsx bestanden in data/ in en bouw een set van art.nummers.
 
-    Verwacht een kolom met de naam ARTICLE_NUMBER_COL ('Art.nummer').
-    Sheets zonder die kolom worden genegeerd. Lege cellen overgeslagen.
+    Aanvaardt meerdere kolomnamen (zie ARTICLE_NUMBER_COLS) zodat zowel
+    handgemaakte importlijsten als Robaws-exports werken. Sheets zonder
+    enige geldige kolom worden genegeerd. Waarden worden genormaliseerd
+    (alle whitespace verwijderd) voor robuuste matching.
     """
     numbers = set()
     for path in sorted(data_dir.glob("*.xlsx")):
@@ -627,19 +646,18 @@ def load_master_article_numbers(data_dir: Path) -> set:
                 continue
             if not header:
                 continue
-            try:
-                col_idx = [str(c).strip() if c is not None else "" for c in header]\
-                    .index(ARTICLE_NUMBER_COL)
-            except ValueError:
+            header_strs = [str(c).strip() if c is not None else "" for c in header]
+            col_idx = None
+            for candidate in ARTICLE_NUMBER_COLS:
+                if candidate in header_strs:
+                    col_idx = header_strs.index(candidate)
+                    break
+            if col_idx is None:
                 continue
             for row in rows:
                 if col_idx >= len(row):
                     continue
-                val = row[col_idx]
-                if val is None:
-                    continue
-                # Forceer string (Excel kan ints maken)
-                s = str(val).strip()
+                s = normalize_article_number(row[col_idx])
                 if s:
                     numbers.add(s)
         wb.close()
