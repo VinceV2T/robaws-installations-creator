@@ -111,10 +111,11 @@ def main() -> int:
         "bestelbon_count": 0,
         "lines_evaluated": 0,
         "lines_matched": 0,
-        "installations_created": [],
-        "lines_linked": [],                 # bestelbon-lijnen met materialId gepatcht
-        "skipped_already_linked": [],       # materialId was al gezet
-        "skipped_not_in_masterlist": 0,     # tellen, niet detail
+        "installations_created": [],         # nieuwe installaties via POST
+        "installations_reused": [],          # bestaande installaties hergebruikt (geen POST)
+        "lines_linked": [],                  # bestelbon-lijnen met materialId gepatcht
+        "skipped_already_linked": [],        # materialId was al gezet
+        "skipped_not_in_masterlist": 0,      # tellen, niet detail
         "errors": [],
     }
 
@@ -247,7 +248,23 @@ def main() -> int:
             if quantity <= 0:
                 quantity = 1  # minimum 1 als veiligheid
 
-            # Payload bouwen voor de installatie
+            # Eerst checken of er al installaties bestaan voor (project, artikel).
+            # Manueel aangemaakte installaties die nog niet via materialId
+            # gekoppeld zijn, mogen hergebruikt worden i.p.v. dupliceren.
+            existing_installations = []
+            try:
+                existing_installations = find_installations(
+                    session, base_url, project_id, article_id
+                )
+            except Exception as exc:
+                report["errors"].append({
+                    "stage": "find_installations",
+                    "bestelbon": bb_logic, "line_id": line_id,
+                    "error": str(exc),
+                })
+                continue
+
+            # Payload bouwen voor de installatie (enkel nodig als we POST'en)
             payload = {
                 "name": article_name or article_number,
                 "serialNumber": "",            # bewust leeg, ingevuld bij levering
@@ -276,12 +293,32 @@ def main() -> int:
             # Lege strings & None weghalen om Robaws niet te confuseren
             payload = {k: v for k, v in payload.items() if v not in (None, "")}
 
-            # Eerste installatie aanmaken EN materialId op de bestelbon-lijn
-            # patchen. Eventuele extra installaties (bij quantity > 1) krijgen
-            # geen aparte link op de lijn (de lijn kan slechts 1 materialId
-            # bevatten); ze hangen via assignedProjectId aan het project.
+            # Bepaal hoeveel installaties we nog moeten aanmaken.
+            # Bestaande installaties hergebruiken we; enkel het tekort wordt
+            # aangevuld met nieuwe POST'en.
+            already_count = len(existing_installations)
+            to_create = max(0, quantity - already_count)
+
+            # Het materialId voor de PATCH komt bij voorkeur uit een
+            # bestaande installatie (zo blijft de manueel aangemaakte fiche
+            # leidend); anders uit de eerste nieuw aangemaakte installatie.
             first_installation_id = None
-            for n in range(quantity):
+            if existing_installations:
+                first_installation_id = existing_installations[0].get("id")
+                for inst in existing_installations[:quantity]:
+                    report["installations_reused"].append({
+                        "bestelbon": bb_logic, "line_id": line_id,
+                        "project_id": project_id,
+                        "article_number": article_number,
+                        "installation_id": inst.get("id"),
+                        "installation_name": inst.get("name"),
+                    })
+                    print(f"  [HERGEBRUIK] {bb_logic} lijn {line_id}: "
+                          f"bestaande installatie {inst.get('id')} ({inst.get('name')}) "
+                          f"voor {article_number} gevonden, geen nieuwe gemaakt")
+
+            # Aanvullen met nieuwe installaties indien nodig
+            for n in range(to_create):
                 if dry_run:
                     report["installations_created"].append({
                         "bestelbon": bb_logic, "line_id": line_id,
@@ -296,15 +333,15 @@ def main() -> int:
                         },
                     })
                     print(f"  [DRY] {bb_logic} lijn {line_id}: "
-                          f"zou installatie {n+1}/{quantity} aanmaken voor "
+                          f"zou installatie {already_count+n+1}/{quantity} aanmaken voor "
                           f"{article_number} ({article_name}) op project {project_id}")
-                    if n == 0:
+                    if first_installation_id is None and n == 0:
                         first_installation_id = "<DRY_ID>"
                 else:
                     try:
                         created = create_installation(session, base_url, payload)
                         installation_id = created.get("id")
-                        if n == 0:
+                        if first_installation_id is None and n == 0:
                             first_installation_id = installation_id
                         report["installations_created"].append({
                             "bestelbon": bb_logic, "line_id": line_id,
@@ -315,7 +352,7 @@ def main() -> int:
                             "installation_id": installation_id,
                         })
                         print(f"  [LIVE] {bb_logic} lijn {line_id}: "
-                              f"installatie {n+1}/{quantity} aangemaakt "
+                              f"installatie {already_count+n+1}/{quantity} aangemaakt "
                               f"(id={installation_id}) voor {article_number}")
                     except Exception as exc:
                         report["errors"].append({
@@ -370,6 +407,7 @@ def main() -> int:
     print(f"Lijnen geëvalueerd          : {report['lines_evaluated']}")
     print(f"Lijnen matched (masterlist) : {report['lines_matched']}")
     print(f"Installaties aangemaakt     : {len(report['installations_created'])}")
+    print(f"Installaties hergebruikt    : {len(report['installations_reused'])}")
     print(f"Bestelbon-lijnen gelinkt    : {len(report['lines_linked'])}")
     print(f"Skipped (materialId al gezet): {len(report['skipped_already_linked'])}")
     print(f"Skipped (niet in masterlist): {report['skipped_not_in_masterlist']}")
@@ -512,6 +550,24 @@ def fetch_sales_order(session, base_url, sales_order_id):
     r = session.get(url, timeout=30)
     r.raise_for_status()
     return r.json()
+
+
+def find_installations(session, base_url, project_id, article_id):
+    """Zoek alle installaties die al bestaan voor (projectId, articleId).
+
+    Geeft de lijst items terug. Lege lijst betekent: nog niets aangemaakt.
+    """
+    url = f"{base_url}/api/v2/installations"
+    params = {
+        "projectId": project_id,
+        "articleId": article_id,
+        "size": 100,
+        "page": 0,
+    }
+    r = session.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    payload = r.json()
+    return payload.get("items") or []
 
 
 def create_installation(session, base_url, payload):
