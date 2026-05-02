@@ -394,10 +394,9 @@ def main() -> int:
                     "city": address.get("city") or "",
                     "country": address.get("country") or "",
                 },
-                "extraFields": {
-                    "source_bestelbon": bb_logic,
-                    "source_bestelbon_line_id": str(line_id),
-                },
+                # extraFields niet meesturen: Robaws heeft een getypeerd schema
+                # voor extraFields en weigert willekeurige sleutels (HTTP 400).
+                # We tracken de bron via materialId op de bestelbon-lijn.
             }
             # Lege strings & None weghalen om Robaws niet te confuseren
             payload = {k: v for k, v in payload.items() if v not in (None, "")}
